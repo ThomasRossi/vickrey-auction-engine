@@ -16,6 +16,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./pow": {
+      "types": "./dist/pow/index.d.ts",
+      "import": "./dist/pow/index.js"
+    },
     "./adapters/memory": {
       "types": "./dist/adapters/memory/index.d.ts",
       "import": "./dist/adapters/memory/index.js"

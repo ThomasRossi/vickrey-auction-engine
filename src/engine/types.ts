@@ -75,6 +75,11 @@ export interface PortfolioResult {
   readonly ttlMs: number;
   readonly rotationIntervalMs: number;
   readonly viewThresholdMs: number;
+  /**
+   * Bits of leading-zero work the client must produce per metrics event.
+   * Server-authoritative; clients must not override.
+   */
+  readonly powDifficultyBits: number;
   readonly balances: BalancesSnapshot;
 }
 
@@ -100,6 +105,11 @@ export interface SettleRequest {
   /** Only meaningful for impressions; settle rejects if below view threshold. */
   readonly viewedMs?: number;
   readonly userId: string;
+  /**
+   * Hex SHA-256 hash-cash solution for the puzzle bound to (token, eventId).
+   * Required when EngineConfig.powDifficultyBits > 0; omitted otherwise.
+   */
+  readonly powSolution?: string;
 }
 
 export type SettleResult =
@@ -111,7 +121,9 @@ export type SettleRejectReason =
   | 'bad_token'
   | 'token_expired'
   | 'user_mismatch'
-  | 'below_view_threshold';
+  | 'below_view_threshold'
+  | 'bad_pow'
+  | 'pow_too_fast';
 
 export interface EngineConfig {
   /** Reserve price for the auction, in micros. */
@@ -132,4 +144,17 @@ export interface EngineConfig {
   readonly userShareBps: number;
   /** A click is worth this many impression-equivalents. */
   readonly clickWeight: number;
+  /**
+   * Proof-of-work difficulty (leading zero bits) required per metrics event.
+   * 0 disables the check. Tune so expected wall time on a typical client
+   * approximates viewThresholdMs — saturation attacks then pay CPU per fake
+   * event instead of getting them free.
+   */
+  readonly powDifficultyBits: number;
+  /**
+   * Minimum elapsed time between token issuance and event settlement, in ms.
+   * Catches fast solvers (GPU/ASIC) that crank through the puzzle below the
+   * intended cost floor. 0 disables the check.
+   */
+  readonly powMinElapsedMs: number;
 }

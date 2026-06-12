@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { makeRunPortfolio } from '../src/engine/portfolio.js';
 import { makeSettleEvent } from '../src/engine/settlement.js';
 import { createHmacTokenSigner } from '../src/engine/token.js';
+import { derivePuzzle, solve } from '../src/pow/index.js';
 import {
   fixedClock,
   memoryCampaignIndex,
@@ -22,7 +23,14 @@ const cfg: EngineConfig = {
   idempotencyTtlSec: 600,
   userShareBps: 5000,
   clickWeight: 50,
+  // Difficulty stays low in tests so solving is sub-ms.
+  powDifficultyBits: 8,
+  powMinElapsedMs: 0,
 };
+
+function solveFor(token: string, eventId: string, difficultyBits = cfg.powDifficultyBits): string {
+  return solve(derivePuzzle(`${token}:${eventId}`, difficultyBits)).solution;
+}
 
 function build(overrides: { candidates?: CandidateBid[]; pacingGrants?: Set<number> } = {}) {
   const candidates: CandidateBid[] = overrides.candidates ?? [
@@ -113,7 +121,10 @@ describe('settleEvent', () => {
   it('posts a ledger entry for a valid impression', async () => {
     const { deps, ledger, token } = await setupServed();
     const settle = makeSettleEvent(deps, cfg);
-    const r = await settle({ token, eventId: 'e1', kind: 'impression', viewedMs: 3500, userId: 'u1' });
+    const r = await settle({
+      token, eventId: 'e1', kind: 'impression', viewedMs: 3500, userId: 'u1',
+      powSolution: solveFor(token, 'e1'),
+    });
     expect(r.status).toBe('posted');
     expect(ledger.entries.length).toBe(1);
     expect(ledger.entries[0]!.debitMicros).toBe(800);
@@ -123,7 +134,10 @@ describe('settleEvent', () => {
   it('weights a click at 50× an impression', async () => {
     const { deps, ledger, token } = await setupServed();
     const settle = makeSettleEvent(deps, cfg);
-    const r = await settle({ token, eventId: 'e1', kind: 'click', userId: 'u1' });
+    const r = await settle({
+      token, eventId: 'e1', kind: 'click', userId: 'u1',
+      powSolution: solveFor(token, 'e1'),
+    });
     expect(r.status).toBe('posted');
     expect(ledger.entries[0]!.debitMicros).toBe(800 * 50);
     expect(ledger.entries[0]!.creditMicros).toBe((800 * 50) / 2);
@@ -132,14 +146,20 @@ describe('settleEvent', () => {
   it('rejects below view threshold', async () => {
     const { deps, token } = await setupServed();
     const settle = makeSettleEvent(deps, cfg);
-    const r = await settle({ token, eventId: 'e1', kind: 'impression', viewedMs: 1500, userId: 'u1' });
+    const r = await settle({
+      token, eventId: 'e1', kind: 'impression', viewedMs: 1500, userId: 'u1',
+      powSolution: solveFor(token, 'e1'),
+    });
     expect(r).toEqual({ status: 'rejected', reason: 'below_view_threshold' });
   });
 
   it('is idempotent on (token, eventId)', async () => {
     const { deps, ledger, token } = await setupServed();
     const settle = makeSettleEvent(deps, cfg);
-    const args = { token, eventId: 'e1', kind: 'impression' as const, viewedMs: 3500, userId: 'u1' };
+    const args = {
+      token, eventId: 'e1', kind: 'impression' as const, viewedMs: 3500, userId: 'u1',
+      powSolution: solveFor(token, 'e1'),
+    };
     const a = await settle(args);
     const b = await settle(args);
     expect(a.status).toBe('posted');
@@ -150,14 +170,20 @@ describe('settleEvent', () => {
   it('rejects tokens posted by the wrong user', async () => {
     const { deps, token } = await setupServed();
     const settle = makeSettleEvent(deps, cfg);
-    const r = await settle({ token, eventId: 'e1', kind: 'impression', viewedMs: 3500, userId: 'other-user' });
+    const r = await settle({
+      token, eventId: 'e1', kind: 'impression', viewedMs: 3500, userId: 'other-user',
+      powSolution: solveFor(token, 'e1'),
+    });
     expect(r).toEqual({ status: 'rejected', reason: 'user_mismatch' });
   });
 
   it('routes demo events to the demo ledger with zero user credit', async () => {
     const { deps, ledger, token } = await setupServed({ mode: 'demo' });
     const settle = makeSettleEvent(deps, cfg);
-    const r = await settle({ token, eventId: 'e1', kind: 'impression', viewedMs: 3500, userId: 'u1' });
+    const r = await settle({
+      token, eventId: 'e1', kind: 'impression', viewedMs: 3500, userId: 'u1',
+      powSolution: solveFor(token, 'e1'),
+    });
     expect(r.status).toBe('posted');
     expect(ledger.entries[0]!.mode).toBe('demo');
     expect(ledger.entries[0]!.creditMicros).toBe(0);
@@ -169,5 +195,37 @@ describe('settleEvent', () => {
     const settle = makeSettleEvent(deps, cfg);
     const r = await settle({ token: 'garbage', eventId: 'e1', kind: 'click', userId: 'u1' });
     expect(r).toEqual({ status: 'rejected', reason: 'bad_token' });
+  });
+
+  it('rejects events missing a valid PoW solution', async () => {
+    const { deps, ledger, token } = await setupServed();
+    const settle = makeSettleEvent(deps, cfg);
+    const r = await settle({
+      token, eventId: 'e1', kind: 'impression', viewedMs: 3500, userId: 'u1',
+    });
+    expect(r).toEqual({ status: 'rejected', reason: 'bad_pow' });
+    expect(ledger.entries.length).toBe(0);
+  });
+
+  it('rejects a solution bound to a different eventId (per-event binding)', async () => {
+    const { deps, token } = await setupServed();
+    const settle = makeSettleEvent(deps, cfg);
+    const stolenSolution = solveFor(token, 'e1');
+    const r = await settle({
+      token, eventId: 'e2', kind: 'impression', viewedMs: 3500, userId: 'u1',
+      powSolution: stolenSolution,
+    });
+    expect(r).toEqual({ status: 'rejected', reason: 'bad_pow' });
+  });
+
+  it('rejects events that beat the minimum-elapsed floor', async () => {
+    const { deps, token } = await setupServed();
+    const strictCfg = { ...cfg, powMinElapsedMs: 60_000 };
+    const settle = makeSettleEvent(deps, strictCfg);
+    const r = await settle({
+      token, eventId: 'e1', kind: 'impression', viewedMs: 3500, userId: 'u1',
+      powSolution: solveFor(token, 'e1'),
+    });
+    expect(r).toEqual({ status: 'rejected', reason: 'pow_too_fast' });
   });
 });

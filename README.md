@@ -4,7 +4,7 @@ A single-slot sealed-bid second-price (**Vickrey**) ad auction engine, packaged 
 
 ```bash
 npm install
-npm test         # 71 tests, ~300ms
+npm test         # 83 tests, ~300ms
 npm run bench    # hot-path microbenchmarks
 ```
 
@@ -137,6 +137,62 @@ We don't need Kafka for this. Kafka is the right answer when you have multiple i
 
 **4. The 50× click weight.** A click is worth roughly 50× an impression by the configured `clickWeight`. This is just a multiplier on the stamped clearing price — same code path as an impression, same ledger row shape.
 
+### Proof of work: making fabricated events expensive
+
+The signed session token guarantees that the server's clearing decision can't be tampered with on the way to settlement. What it can't guarantee is that an event actually happened. A reverse-engineered client can request a legitimate portfolio, receive a real signed token, and then post `/v1/metrics` events that are byte-for-byte indistinguishable from honest traffic — they just claim views that never rendered to a screen. Idempotency stops **replays**, not **fabrications**: each forged event picks a fresh `event_id` and bypasses the idempotency key.
+
+This isn't theoretical. The kickbacks team has seen exactly this attack in the wild, with a script that emulates the cadence of a real client to harvest payouts at scale.
+
+The defense is a small **SHA-256 hash-cash proof of work** the client must produce per metrics event:
+
+> Find `solution` such that `sha256(nonce ‖ solution)` has at least `K` leading zero bits.
+
+The nonce is **deterministically derived from `(sessionToken, eventId)`** so the server doesn't need to store anything per puzzle. The difficulty `K` is set by `EngineConfig.powDifficultyBits` and reported to the client in the portfolio response so it knows how much work to do. The settlement path recomputes the puzzle from the submitted `token` and `eventId`, verifies the solution in one SHA-256, and rejects with `bad_pow` if it doesn't meet the bar.
+
+**Why bind the puzzle to `eventId`, not just the token.** The engine allows more than one event per token — an impression at the 3 s mark, then a click later. If the puzzle were token-scoped, an attacker would solve it once and then spam an unbounded number of fake events under the same solution. Per-event binding means **N fake events cost N puzzle solves** — the asymmetry that makes the attack expensive scales linearly with fraud volume rather than being amortised away.
+
+**Why a time floor.** Hash-cash only works because the only way to find the solution is to grind. CPU clients grind at roughly the rate `K` was calibrated for; a GPU or ASIC grinds much faster and could land a valid solution in milliseconds. To bound this, settlement also rejects events whose `nowMs - tokenIssuedAtMs < powMinElapsedMs`. Honest clients are unaffected — they're going to wait the view threshold anyway — but fast solvers get cut off below the intended cost floor.
+
+**Why it isn't security theatre.** Hash-cash doesn't *stop* a determined attacker with a GPU farm and patience; it makes fabrication **cost CPU time per fake event**. With `K` calibrated so honest devices spend ~3 s of one worker thread per impression (in practice ~18–20 bits on a typical phone), a 16-core attacker fakes at most a handful of events per second per token they hold — versus an unbounded rate without it. That's the difference between "free fraud" and "a CPU-bound business problem the attacker has to solve." Combined with rate limits at the host layer, it's enough.
+
+**Where it lives.** The puzzle library is a subpath export, not part of the engine core:
+
+```ts
+import {
+  issuePuzzle,   // fresh random puzzle
+  derivePuzzle,  // deterministic puzzle from a binding string
+  solve,         // grind a solution (client / tests only)
+  verify,        // one SHA-256
+} from '@kickbacks/auction-engine/pow';
+```
+
+`src/pow/` has zero engine awareness — no token, no event, no auction. The engine wires it into settlement; any other surface in the host (abusive form submissions, rate-limited APIs, anything that wants per-request cost) can use it the same way.
+
+**Wiring on the server.** Already done — set the two new config knobs:
+
+```ts
+createEngine(deps, {
+  // ...existing fields...
+  powDifficultyBits: 18,   // server-authoritative; clients can't lower it
+  powMinElapsedMs: 1_500,  // reject events that solve too fast
+});
+```
+
+`runPortfolio` returns `powDifficultyBits` in the result; `settleEvent` reads `req.powSolution` and rejects with `bad_pow` or `pow_too_fast` if anything is off. The check runs **before** the idempotency claim, so a failed PoW doesn't waste a Redis slot.
+
+**Wiring on the client.** Port the solver (it's ~15 lines of SHA-256 in a loop) into a Web Worker / coroutine / background thread so the UI stays responsive. When the ad renders:
+
+1. Note `tokenIssuedAtMs` (or just "now").
+2. Pick the `event_id` you'll submit with the impression — it must be the same one the puzzle is bound to.
+3. Compute `nonce = sha256(`${sessionToken}:${eventId}`).slice(0, 16 hex)` and grind a solution at the difficulty the portfolio response specified.
+4. When the view threshold elapses (you're going to wait anyway), POST `/v1/metrics` with the solution alongside `token`, `event_id`, `kind`, `viewed_ms`.
+
+For clicks, do the same with the click's `event_id`. Different event, different puzzle, different solve.
+
+**Rollout plan.** Ship with `powDifficultyBits: 0` so the wire format change deploys without rejecting any traffic. Confirm clients are sending `pow_solution`. Then ratchet difficulty up over a few releases — the server skips PoW entirely when configured difficulty is 0, so the change is safely staged.
+
+**Calibrating `K`.** Run `solve(issuePuzzle(K))` on representative target hardware (low-end phone, mid-range phone, laptop). Pick the `K` where the lowest-end device lands within the view threshold. Typical answer is 18–20 bits.
+
 ### Money lives in integer micros
 
 Every monetary value in the engine — bids, reserves, clearing prices, debits, credits — is stored as an integer number of **micros** (CPM × 10⁶). Floats appear only as the `qualityFactor` multiplier and are floored back to micros before any ledger write.
@@ -196,8 +252,9 @@ For one `runPortfolio` call serving `depth` ads to one user:
 For one `settleEvent` call:
 
 1. One HMAC verify, ~1 µs.
-2. One Redis `SET NX EX` for idempotency.
-3. One Postgres transaction: insert into `impressions` or `clicks`, insert into `ledger_entries`, insert into `outbox`. All under one `BEGIN/COMMIT`.
+2. One PoW verify (one SHA-256) — skipped entirely when `powDifficultyBits` is 0.
+3. One Redis `SET NX EX` for idempotency.
+4. One Postgres transaction: insert into `impressions` or `clicks`, insert into `ledger_entries`, insert into `outbox`. All under one `BEGIN/COMMIT`.
 
 That's the entire serving and settlement loop. There is no per-impression auction, no served-tokens lookup on the hot path, no synchronous projection update.
 
@@ -218,6 +275,9 @@ src/
     rng.ts                       xorshift32, fnv1a32, deriveSeed
     types.ts                     Internal domain types
     ports.ts                     CampaignIndex, PacingStore, LedgerRepo, ...
+  pow/
+    index.ts                     Generic SHA-256 hash-cash; subpath export
+                                 @kickbacks/auction-engine/pow
   adapters/
     memory/                      In-memory fakes for tests
     redis/                       Token-bucket pacing (Lua), SET NX EX idempotency
@@ -225,7 +285,7 @@ src/
   sql/
     0001_init.sql                Schema: campaigns, ledger, outbox, balances, ...
 test/
-  *.spec.ts                      71 tests across all of the above
+  *.spec.ts                      83 tests across all of the above
 bench/
   auction.bench.ts               Microbenchmarks for the hot path
 examples/
@@ -272,4 +332,4 @@ If you find yourself wanting to add an HTTP framework dependency to `src/engine/
 - **Multi-slot auctions.** GSP across multiple positions is a different (harder) problem; not needed for a single-slot ad surface.
 - **OpenRTB.** Real-time bidding integrations belong in a separate adapter if and when external demand arrives.
 - **Bid shading.** Not needed — Vickrey makes truthful bidding dominant. Don't reintroduce this.
-- **Click fraud detection.** Token verification + idempotency catch the simple cases. Anything more sophisticated belongs in a separate service.
+- **Click fraud detection beyond cost-per-event.** Token verification, idempotency, and per-event proof of work bound how cheap fabrication can be. Anything more sophisticated — behavioural models, device attestation, IP reputation — belongs in a separate service that can reject events before they reach `settleEvent`.

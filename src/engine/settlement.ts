@@ -21,6 +21,7 @@
 import type { EnginePorts } from './ports.js';
 import { fnv1a32 } from './rng.js';
 import { settleDebitMicros, userCreditMicros } from './pricing.js';
+import { derivePuzzle, verify as verifyPow } from '../pow/index.js';
 import type { EngineConfig, SettleRequest, SettleResult } from './types.js';
 
 export function makeSettleEvent(deps: EnginePorts, cfg: EngineConfig) {
@@ -41,6 +42,18 @@ export function makeSettleEvent(deps: EnginePorts, cfg: EngineConfig) {
     if (req.kind === 'impression') {
       if ((req.viewedMs ?? 0) < cfg.viewThresholdMs) {
         return { status: 'rejected', reason: 'below_view_threshold' };
+      }
+    }
+
+    // PoW must clear before we spend any storage on the event. Cheap reject
+    // path so attackers can't waste an idempotency slot per fake submission.
+    if (cfg.powDifficultyBits > 0) {
+      if (nowMs - payload.issuedAtMs < cfg.powMinElapsedMs) {
+        return { status: 'rejected', reason: 'pow_too_fast' };
+      }
+      const puzzle = derivePuzzle(`${req.token}:${req.eventId}`, cfg.powDifficultyBits);
+      if (!verifyPow(puzzle, req.powSolution ?? '')) {
+        return { status: 'rejected', reason: 'bad_pow' };
       }
     }
 

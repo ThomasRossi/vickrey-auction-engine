@@ -64,6 +64,7 @@ export function makeRunPortfolio(deps: EnginePorts, cfg: EngineConfig) {
       ttlMs: cfg.queueTtlMs,
       rotationIntervalMs: cfg.rotationIntervalMs,
       viewThresholdMs: cfg.viewThresholdMs,
+      powDifficultyBits: cfg.powDifficultyBits,
       balances,
     };
   };
